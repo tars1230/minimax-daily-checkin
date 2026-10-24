@@ -1,0 +1,30 @@
+{
+  "name": "minimax-daily-checkin",
+  "version": "1.0.0",
+  "description": "MiniMax Code 每日签到 —— 纯 HTTP 直连，不启动桌面端、不拉起 TUI",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "mcode-checkin-direct.mjs",
+    "tools/"
+  ],
+  "keywords": [
+    "minimax",
+    "minimax-code",
+    "checkin",
+    "signin",
+    "oauth"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tars1230/minimax-daily-checkin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tars1230/minimax-daily-checkin/issues"
+  },
+  "homepage": "https://github.com/tars1230/minimax-daily-checkin#readme"
+}

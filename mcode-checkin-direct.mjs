@@ -53,11 +53,24 @@ const LOG_MAX_BYTES = 2 * 1024 * 1024;
 const CLIENT_ID = "mcode-public";
 const SCOPES = ["agent.default"];
 const AUDIENCE = "agent-backend";
+// ⚠️ 域名的 env 覆盖规则（复核项 #10）：
+//   · 每个 region 有**独立**的变量（..._CN / ..._EN），互不串味；
+//   · 另保留不带后缀的全局变量，**同时**覆盖 cn/en（老用法，不破坏兼容）。
+//   之前只有一个 MCODE_AGENT_ORIGIN 同时管 cn/en —— 为 cn 调域名时会顺手改掉 en。
+//
+// ⚠️⚠️ 安全提示（发布到公开仓库前必须写进 README）：
+//   MCODE_OAUTH_TOKEN_ENDPOINT / MCODE_ACCOUNT_ORIGIN* 可以把 **refresh_token**
+//   发到**任意主机**。它们是给沙箱测试用的钩子，**不要**在生产环境里设置。
+//   本脚本不会自己修改凭据库以外的任何东西，但只要设了这个变量，
+//   续期请求就会把 RT 发到那个地址 —— 相当于把长期凭据交出去。
 const AGENT_ORIGIN = {
-  cn: process.env.MCODE_AGENT_ORIGIN || "https://agent.minimaxi.com",
-  en: process.env.MCODE_AGENT_ORIGIN || "https://agent.minimax.io",
+  cn: process.env.MCODE_AGENT_ORIGIN_CN || process.env.MCODE_AGENT_ORIGIN || "https://agent.minimaxi.com",
+  en: process.env.MCODE_AGENT_ORIGIN_EN || process.env.MCODE_AGENT_ORIGIN || "https://agent.minimax.io",
 };
-const ACCOUNT_ORIGIN = { cn: "https://account.minimaxi.com", en: "https://account.minimax.io" };
+const ACCOUNT_ORIGIN = {
+  cn: process.env.MCODE_ACCOUNT_ORIGIN_CN || process.env.MCODE_ACCOUNT_ORIGIN || "https://account.minimaxi.com",
+  en: process.env.MCODE_ACCOUNT_ORIGIN_EN || process.env.MCODE_ACCOUNT_ORIGIN || "https://account.minimax.io",
+};
 
 /**
  * OAuth token 端点：必须按**解析出来的** region 取（与签到端点同源）。
@@ -460,6 +473,20 @@ async function writeAuthJson(authJsonPath, payload) {
     attempts: WRITE_RETRY_ATTEMPTS,
     baseDelayMs: 250,
     maxDelayMs: WRITE_RETRY_MAX_DELAY_MS,
+    // 为什么保留 fallbackDirect（独立复核提过「兜底太激进」的建议，此处**不采纳**，理由如下）：
+    //
+    // 复核者的顾虑是「直接覆盖写不是原子替换，半写崩了库就是坏的」。但要看**失效方向**：
+    //   - 不走兜底、rename 一直失败 ⇒ 抛出 ⇒ 新 RT 只留在 pending 里，
+    //     store 里的 auth.json 仍是**已被服务端作废的旧 RT** ⇒ 桌面端下次续期 invalid_grant
+    //     ⇒ **用户被踢回登录页**。
+    //   - 走兜底、directOverwriteFile 成功 ⇒ 新 RT 立刻进 store ⇒ 会话当场救回。
+    //   - 走兜底且 direct 自己也失败 ⇒ 抛错，与「不走兜底」同样的结果，**没有更差**。
+    //
+    // 即：直写兜底唯一新增的风险是「写坏了库」，而它在同一场景下的替代方案是「会话当场死亡」；
+    // 且 directOverwriteFile 内部有回读校验（见其实现），能发现写坏。
+    //
+    // **不要**因为「看起来不够原子」就把它关掉 —— 那是把一个低概率数据损坏风险
+    // 换成一个高概率的「用户被踢下线」。宁可留注释，别做这种「看起来更安全」的收紧。
     fallbackDirect: true,
   });
 }
@@ -723,18 +750,39 @@ async function refreshAccessToken({ record, region, endpoint }) {
     scope: SCOPES.join(" "),
     audience: AUDIENCE,
   });
-  const res = await httpsRequest(endpoint, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Content-Length": Buffer.byteLength(form.toString()),
-    },
-    body: form.toString(),
-    // ≤5s：临界区必须显著短于上游的 stale 阈值（30s）与重试预算（≈24s），
-    // 否则桌面端会把自己的锁判成陈旧并抢走（叠加 C3/C4 = 跨进程覆盖）。
-    timeoutMs: Number(process.env.MCODE_CHECKIN_OAUTH_TIMEOUT_MS ?? 5000),
-  });
+  let res;
+  try {
+    res = await httpsRequest(endpoint, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(form.toString()),
+      },
+      body: form.toString(),
+      // ≤5s：临界区必须显著短于上游的 stale 阈值（30s）与重试预算（≈24s），
+      // 否则桌面端会把自己的锁判成陈旧并抢走（叠加 C3/C4 = 跨进程覆盖）。
+      timeoutMs: Number(process.env.MCODE_CHECKIN_OAUTH_TIMEOUT_MS ?? 5000),
+    });
+  } catch (e) {
+    // ⚠️ token 端点的网络故障**不能**按「可重试」处理：
+    //   请求可能已经到达服务端并被消费（RT 已轮换），只是响应没回来。
+    //   此时旧 RT 已死 —— 再重试只会拿到 invalid_grant，
+    //   而脚本没有任何路径能找回那个新 RT。
+    //   所以按**致命**报出，并明确要求用户 `mcode login` 重建会话。
+    if (!e?.status) {
+      const err = new Error(
+        `token refresh request failed before a response was received (${e?.message ?? e}). ` +
+          `The refresh_token may already have been consumed and rotated by the server, in which case ` +
+          `the old one is dead and cannot be recovered — run \`mcode login\` to restore the session.`,
+      );
+      err.stage = "oauth";
+      err.retryable = false;
+      err.mayHaveConsumedRefreshToken = true;
+      throw err;
+    }
+    throw e;
+  }
   const text = res.text;
   if (res.status < 200 || res.status >= 300) {
     const e = new Error(`token refresh failed HTTP ${res.status}: ${redactSensitive(text.slice(0, 300))}`);
@@ -889,13 +937,31 @@ function buildRequest(endpoint, { token, realUserID, body, nowMs, region }) {
   };
 }
 
-/** L10：找不到就标 known=false，别让 "0.0.0" 冒充真实版本混进签名请求 */
+/**
+ * L10：找不到就标 known=false，别让 "0.0.0" 冒充真实版本混进签名请求。
+ *
+ * 候选来源（按可靠性排序，全部**不写死盘符**）：
+ *   1. MCODE_CODE_PACKAGE_JSON —— 显式指定 package.json 的绝对路径（最终兜底）
+ *   2. 全局 npm 安装的 @minimax-ai/code（本机唯一真实来源，实测 0.3.1）
+ *   3. 相对当前 exe 反推的桌面端布局（历史上有过两种目录层级，两种都试）
+ *
+ * 历史教训（务必保留这段注释）：曾硬编码
+ *   "D:/Program Files/MiniMax/MiniMax Code/resources/app.asar.unpacked/node_modules/@minimax-ai/code/package.json"
+ * 这条路径在 mcode 升级后**已经彻底失效** —— 桌面端 bundle 的 app.asar.unpacked/node_modules 下
+ * 只有 @minimax/mcode-sandbox-runtime，**根本没有 @minimax-ai/code**。
+ * 而且安装盘符（D: / C:）和目录名都会随用户/版本变 ⇒ 写死盘符的候选永远是死路，
+ * 只会让人误以为「版本号来自桌面端」实际是来自 npm CLI。
+ */
 function appVersion() {
+  const rel = path.join("node_modules", "@minimax-ai", "code", "package.json");
   const candidates = [
-    path.join(HOME, "..", "AppData", "Roaming", "npm", "node_modules", "@minimax-ai", "code", "package.json"),
-    "D:/Program Files/MiniMax/MiniMax Code/resources/app.asar.unpacked/node_modules/@minimax-ai/code/package.json",
-    path.join(process.execPath, "..", "..", "..", "node_modules", "@minimax-ai", "code", "package.json"),
-  ];
+    process.env.MCODE_CODE_PACKAGE_JSON,
+    path.join(HOME, "..", "AppData", "Roaming", "npm", rel),
+    path.join(process.execPath, "..", "..", rel),
+    path.join(process.execPath, "..", "..", "..", rel),
+    path.join(process.execPath, "..", "resources", "app.asar.unpacked", rel),
+    path.join(process.execPath, "..", "..", "resources", "app.asar.unpacked", rel),
+  ].filter(Boolean);
   for (const c of candidates) {
     const j = readJsonSafe(path.resolve(c));
     if (j?.version) return { version: String(j.version), known: true };
@@ -1009,9 +1075,30 @@ function isValidClaim(claim) {
  */
 function isMCodeRunning() {
   try {
+    // ⚠️ 自匹配陷阱（2026-10-24 实测发现）：
+    //   探测命令的命令行里**本身就含有**模式字面量（如 '@minimax-ai\code'），
+    //   所以探测自己派生出来的 powershell.exe 子进程会匹配上自己。
+    //   原实现只排除了 node 自身的 PID（process.pid），排不掉这个 powershell 子进程
+    //   → 计数恒 ≥ 1 → 探测恒返回「在运行」→
+    //   ① AT 过期后永远走「等桌面端续期」分支 → 空等 10 分钟 → exit 3；
+    //   ② 自续期写回分支运行时不可达，整套写库护栏形同虚设。
+    //
+    // 修法：给探测命令注入一个随机 marker，并排除命令行里含该 marker 的进程。
+    //   marker 是 16 位随机十六进制，探测自己派生的 powershell 命令行里必然含它
+    //   （它就写在查询文本里）⇒ 自匹配被**精确**排除。
+    //
+    // ⚠️ **不要再加「父进程是 node 自身」这类排除**（2026-10-24 定向破坏实测）：
+    //   它会造成**真实漏报** —— 任何恰好是本脚本 node 进程的直接子进程、
+    //   同时命令行含 @minimax-ai\code 的进程会被**静默丢弃**。
+    //   漏报 ⇒ 误判「MCode 没在跑」⇒ 去轮换共享 refresh_token ⇒ 把用户踢回登录页。
+    //   实测：带该排除时，合成一个匹配子进程 → 探测漏掉它（FAIL）；
+    //   去掉该排除只保留 marker → 自匹配仍被精确排除（P1 PASS）且合成进程被计入（P2 PASS）。
+    //   ⇒ marker 是「精确排除」，PPID 排除是「粗暴过滤」，后者必须去掉。
+    const marker = `mk${crypto.randomBytes(8).toString("hex")}`;
     const ps =
       `Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ` +
-      `Where-Object { $_.ProcessId -ne ${process.pid} -and ( ` +
+      `Where-Object { $_.ProcessId -ne ${process.pid} -and ` +
+      `$_.CommandLine -notlike '*${marker}*' -and ( ` +
       `$_.Name -like '*MiniMax*' -or $_.Name -like 'mcode*' -or ` +
       `($_.CommandLine -and ( ` +
       `$_.CommandLine -like '*@minimax-ai\\code*' -or ` +
@@ -1148,6 +1235,18 @@ async function refreshAndPersist({ authDir, region, buildEnv }) {
     try {
     // 锁内重读：用的是最新快照，绝不用旧快照覆盖桌面端刚写入的凭据
     const fresh = loadStore(authDir);
+    // C11（锁内复查）：锁外那次检查（main 里）用的是**加锁前的旧快照**。
+    // 若在本进程等待锁的期间 store 变成了多记录（且上游精确键消失），
+    // 锁内这份快照就会指向「可能属于别的账号」的记录 → 轮换错账号的 RT。
+    // 所以锁内必须再查一次 ambiguous —— 与 main 里同口径。
+    if (fresh.ambiguous) {
+      const e = new Error(
+        "the auth store contains multiple credential records and the expected upstream key was not found — " +
+          "refusing to guess which account to use",
+      );
+      e.stage = "precondition";
+      throw e;
+    }
     let rec = fresh.record;
     // C9：generation 一律数值化 —— 字符串 "12" 若被当成 0，比较方向会翻转
     const numGen = (v) => {
@@ -1258,6 +1357,23 @@ async function refreshAndPersist({ authDir, region, buildEnv }) {
         const pGen = numGen(pRec.generation);
         // S2：必须同时比过 state 和 credential 两道代数 ——
         // 只比 credential 会在「state 比 credential 新」（外来写入）时把 state 代数写倒退。
+        //
+        // 【残留风险 · 复核项 #5 / #8，2026-10-24 记录，此处**有意不改**】
+        // 这个门槛用「代数更大」代理「pending 里的 RT 更新、还活着」。
+        // 该代理成立的前提是：**所有写者都单调递增 generation**。
+        //   · 上游桌面端已实证成立（commitLogin / refreshCredential 都是 max(state.gen, cred.gen)+1，
+        //     跨登录也继续往上走，绝不重置）—— 这是主场景。
+        //   · 本脚本自己写的 pending 也成立（代数 = 当时的 max+1）。
+        //   · 只有「第三方写者 / 备份恢复 / 手工编辑」写出**更低**代数的凭据时，
+        //     代理才会失效：此时可能采纳一个已死的 RT 并写进共享库 → 桌面端被踢。
+        //
+        // 为什么**不在这里**加「pending 记录来源 + 上一代 RT 指纹」来堵：
+        //   ① 这个判据位于最关键的安全路径上（唯一会把凭据写进共享库的分支），
+        //      而本环境**无法安全实测**写回路径（自续期会轮换真实 RT，软件在跑时轮换=踢人下线）；
+        //   ② 判据本身写错的后果比它堵的洞更糟（把该救回来的会话判成不可救）；
+        //   ③ 触发条件极窄（需要「上次写 auth.json 失败」+「第三方回写更低代数」同时发生）。
+        //   ⇒ 处置：条件明确写在这里 + README「已知边界」章节标注，交给维护者按需加固，
+        //     而不是在一个无法验证的路径上做一次不可回退的改动。
         if (pGen <= credGen || pGen <= stateGen) return null;
         if (!pRec.refreshToken && !pRec.accessToken) return null;
         return { rec: pRec, gen: pGen, store: pendingStore };
@@ -1381,8 +1497,12 @@ async function refreshAndPersist({ authDir, region, buildEnv }) {
     // 否则可能把 generation 写小 → 上游 getStatus 判 "error" → 强制重新登录。
     const currentCredGen = () => {
       try {
-        const g = Number(loadStore(authDir).record?.generation);
-        return Number.isFinite(g) ? g : 0;
+        // 与 numGen 同口径：取整 + 非负 + 非法值归零。
+        // ⚠️ 不能用 `Number.isFinite(g) ? g : 0` —— 那样会把 507.5 这种浮点代数
+        //    原样写进 auth-state.json；而上游 parseStoredCredential 要求
+        //    Number.isSafeInteger(generation) && generation >= 0，
+        //    浮点值会让上游判凭据损坏 → status 'error' → 强制重登。
+        return numGen(loadStore(authDir).record?.generation);
       } catch {
         return 0;
       }
@@ -1586,8 +1706,10 @@ async function refreshAndPersist({ authDir, region, buildEnv }) {
       try {
         const s = loadStore(authDir);
         if (s.state?.status === "refreshing") {
-          const sGen = Number(s.state?.generation) || 0;
-          const cGen = Number(s.record?.generation) || 0;
+          // 与 numGen 同口径：取整 + 非负 + 非法值归零（不能 `Number(x) || 0` ——
+          // 那会把浮点代数原样写进 state，上游判凭据损坏 → 强制重登）
+          const sGen = numGen(s.state?.generation);
+          const cGen = numGen(s.record?.generation);
           // D6：只有「凭据代数确实比 state 新」才对齐写入 ——
           // 否则写出来的 state 代数与凭据不一致，上游 getStatus() 判 "error" → 强制重登
           //（兜底本意是修复，却可能制造 error）。不写则 state 停在 refreshing，上游能自愈。
@@ -1839,8 +1961,11 @@ async function main() {
     // L3：上游比的是**账号**（realUserID），token 指纹只是附加信号
     const nowUserID = resolveRealUserID(authDir, region, buildEnv);
     if (nowUserID && nowUserID !== realUserID) {
+      // 只打指纹：realUserID 是稳定的用户标识，会进 stderr / JSON / 日志文件，
+      // 公开仓库里不该留这种可关联到具体账号的字符串。
       const e = new Error(
-        `MiniMax account changed during daily check-in (realUserID ${realUserID} -> ${nowUserID}). Retry.`
+        `MiniMax account changed during daily check-in ` +
+          `(realUserID ${fingerprint(realUserID)} -> ${fingerprint(nowUserID)}). Retry.`
       );
       e.stage = "claim";
       throw e;

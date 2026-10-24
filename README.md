@@ -93,8 +93,15 @@ OAuth 服务端对同一 `(client_id, 用户)` **只允许一个活跃授权**�
 | 代数校验 | 轮换前校验 `state.status ∈ {authenticated, expired, refreshing}` 且 generation 一致 |
 | 写序 | 先写 `auth.json`（保住新 token），再写 `auth-state.json`（generation 同步） |
 | 绝不沿用 | 响应里没有新的 `refresh_token` → 判致命，**绝不**沿用旧值 |
-| 原子写 | 写前备份原字节；写坏时尽力回滚，绝不留下半截 JSON |
+| 原子写 | 主路径用「同目录临时文件 → fsync → rename」真原子替换；rename 连续失败才降级为原地覆盖写（带备份与回读校验） |
 | 不吞错 | 任一步失败即致命退出，state 保持 `expired`，不回滚成 `authenticated`（那是骗桌面端说"你没事"） |
+
+> **关于「原子写」那一行的降级兜底** —— 有意保留，说明理由：
+> rename 被杀软/索引器占用而连续失败时，`auth.json` 里会留下**已被服务端作废**的旧
+> `refresh_token`。此时**只有**把新 RT 写进去才能救回会话；脚本私有的
+> `auth.json.pending` 桌面端根本不读，帮不上忙。原地覆盖写虽然不是原子替换
+> （进程被硬杀可能留下半截 JSON），但失败模式与「直接放弃」相同（都会被踢下线），
+> 成功模式则当场救回会话 —— 所以它是**弱占优**的兜底，不要因为"看起来不够原子"就关掉。
 
 ### 三条运行路径
 
@@ -112,6 +119,38 @@ access token 仍有效？
 
 ---
 
+## 已知边界（有意保留，不是 bug）
+
+下面几条是独立代码复核提出、**经评估后有意不修**的项。把理由写清楚，
+免得后来的人以为它们是漏掉的。
+
+| 项 | 说明 | 为什么不修 |
+|---|---|---|
+| **cn 域用旧域名** `agent.minimaxi.com` / `account.minimaxi.com` | 上游 prod 配置用的是 `agent.minimax.cn` / `account.minimax.cn`，旧域在上游被标为 legacy | 实测两个域名解析到**同一台服务器**（`47.116.166.79`），旧域目前仍然可用且签到接口正常。改域名属于「换一套未经端到端验证的 OAuth 流程」，风险大于收益。需要时可覆盖：`MCODE_AGENT_ORIGIN_CN` / `MCODE_ACCOUNT_ORIGIN_CN` |
+| **pending 采纳依赖「代数更大 ⇒ RT 还活着」** | 若有**第三方写者**（备份恢复、手工编辑）写入代数更低的凭据，这个代理会失效，可能把已死的 RT 写回共享库 | 前提「所有写者单调递增 generation」对上游桌面端和本脚本都成立（已从上游 `app.asar` 实证）。加固要改**唯一会把凭据写进共享库**的分支，而该路径在「桌面端运行时」无法安全实测（会轮换真实 RT ⇒ 踢人下线）。触发条件也极窄：需「上次写 `auth.json` 失败」+「第三方回写更低代数」同时发生。代码里有对应注释标注 |
+| **OAuth 超时按「可能已消费 RT」处理** | token 端点无响应时，服务端**可能已经**轮换了 RT，旧 RT 已死 | 5 秒超时是刻意短于上游 30 秒的 stale 阈值与重试预算。放宽到 15–30 秒会拉长持锁时间。此类错误按**致命**处理（退出码 1）并明确要求 `mcode login`，而不是标成"可重试"—— 后者会诱导用户重试并撞上 `invalid_grant` |
+| **进程探测基于命令行模式匹配** | 依赖 `@minimax-ai/code` 这类字面量出现在进程命令行里 | 已用随机 marker 排除自匹配，且**不做**「父进程是 node 自身」这类粗暴排除（会漏掉真实匹配进程）。探测失败一律按「桌面端在跑」处理 → 宁可不签也不轮换 |
+
+---
+
+## 代码复核
+
+本工具发布前经过一次**独立代码复核**（由未参与实现的复核者执行），结论为
+「需修改后发布」。复核提出的问题与处置如下：
+
+| 复核项 | 处置 |
+|---|---|
+| 进程探测自匹配（探测自己派生的 powershell 被算进去 ⇒ 探测恒为「在跑」） | **已修**：注入随机 marker 精确排除自匹配。并用定向破坏测试验证两个不变量：① 探测自身永不被计入；② 真实匹配进程永不被漏掉（后者曾因「按父进程 PID 排除」而失败，已移除该排除） |
+| OAuth 超时被当成可重试，可能送掉会话 | **已修**：无响应一律按致命处理，明确提示 `mcode login` |
+| generation 纪律两处破例（浮点代数可能被写进状态文件） | **已修**：统一走「取整 + 非负 + 非法值拒绝」 |
+| 锁内重读未复查「多记录歧义」 | **已修**：锁内补复查，歧义即中止 |
+| `realUserID` 明文落日志 | **已修**：改为指纹（md5 前 8 位） |
+| 硬编码本机安装路径 | **已修**：改为多候选自动探测 + 环境变量覆盖 |
+| 域名环境变量不分区域 | **已修**：拆成按 region 的独立变量 |
+| 原子写降级兜底 / pending 采纳代理 / cn 域名 | **有意保留**，理由见上文「已知边界」 |
+
+---
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -124,10 +163,20 @@ access token 仍有效？
 | `MCODE_CHECKIN_WRITE_MAX_DELAY_MS` | `2000` | 写重试的最大退避间隔 |
 | `MCODE_CHECKIN_OAUTH_TIMEOUT_MS` | `5000` | OAuth 请求超时 |
 | `MCODE_CHECKIN_LOG` | `<HOME>/logs/mcode-checkin.log` | 日志路径 |
-| `MCODE_AGENT_ORIGIN` | 按 region 自动 | 覆盖签到 API origin（沙箱测试用） |
+| `MCODE_AGENT_ORIGIN` | 按 region 自动 | 同时覆盖 cn/en 的签到 API origin（沙箱测试用） |
+| `MCODE_AGENT_ORIGIN_CN` / `_EN` | 同上 | **按 region 单独覆盖**签到 API origin，优先于上面那个 |
+| `MCODE_ACCOUNT_ORIGIN` | 按 region 自动 | 同时覆盖 cn/en 的账号 origin（沙箱测试用） |
+| `MCODE_ACCOUNT_ORIGIN_CN` / `_EN` | 同上 | **按 region 单独覆盖**账号 origin |
 | `MCODE_OAUTH_TOKEN_ENDPOINT` | 按 region 自动 | 覆盖 OAuth token 端点（沙箱测试用） |
+| `MCODE_CODE_PACKAGE_JSON` | 自动探测 | 指定 `@minimax-ai/code/package.json` 的绝对路径（取版本号用） |
 | `MINIMAX_DATA_DIR` / `MAVIS_DATA_DIR` / `MCODE_HOME` | `~/.minimax` | 数据目录覆盖 |
 | `MAVIS_REGION` | 自动探测 | `cn` / `en` |
+
+> ⚠️ **安全警告 —— `MCODE_OAUTH_TOKEN_ENDPOINT` / `MCODE_ACCOUNT_ORIGIN*` 会把 refresh_token 发到任意主机。**
+>
+> 这几个变量是给沙箱测试用的钩子。**一旦设置**，续期请求就会把长期有效的
+> `refresh_token` 发往那个地址 —— 等于把账号的长期凭据交出去。
+> 生产环境**不要**设置它们；本工具默认只连官方域名。
 
 ---
 
@@ -184,7 +233,13 @@ will not rotate its shared refresh_token ...
 node tools/find-checkin-endpoint.mjs
 ```
 
-（路径目前硬编码在脚本顶部 `dir` 变量里，按自己的安装位置改。）
+探针**不再硬编码路径**：依次尝试命令行参数 → `MCODE_CHUNKS_DIR` 环境变量 →
+各平台常见安装位置。找不到就打印它试过哪些路径后退出。
+
+```bash
+node tools/find-checkin-endpoint.mjs "/path/to/MiniMax Code/resources/app.asar.unpacked"
+MCODE_CHUNKS_DIR="/path/to/chunks" node tools/find-checkin-endpoint.mjs
+```
 
 ---
 
@@ -194,6 +249,8 @@ node tools/find-checkin-endpoint.mjs
 mcode-checkin-direct.mjs       # 主脚本（唯一必需文件）
 tools/
   find-checkin-endpoint.mjs     # 逆向溯源探针（可选）
+package.json                    # 元数据（零依赖）
+CHANGELOG.md                    # 变更记录
 ```
 
 ---
