@@ -149,6 +149,19 @@ access token 仍有效？
 | 域名环境变量不分区域 | **已修**：拆成按 region 的独立变量 |
 | 原子写降级兜底 / pending 采纳代理 / cn 域名 | **有意保留**，理由见上文「已知边界」 |
 
+### 复现那次验证
+
+上面那条「进程探测」修复的定向破坏测试**随仓库发布**，任何人可以复现：
+
+```bash
+node tools/test-process-detection.mjs mcode-checkin-direct.mjs
+```
+
+它从**真实脚本源码**里抽取探测函数来测（不是重写版），断言两个不变量：
+① 探测自己派生的子进程永不被计入；② 一个命令行含 `@minimax-ai\code` 的**直接子进程**
+必须被计入 —— 第②条正是用来挡住「按父进程 PID 排除」那类方向相反的新缺陷的。
+脚本形态若变了，测试会**报错退出**而不是静默通过。
+
 ---
 
 ## 环境变量
@@ -249,6 +262,7 @@ MCODE_CHUNKS_DIR="/path/to/chunks" node tools/find-checkin-endpoint.mjs
 mcode-checkin-direct.mjs       # 主脚本（唯一必需文件）
 tools/
   find-checkin-endpoint.mjs     # 逆向溯源探针（可选）
+  test-process-detection.mjs    # 进程探测的定向破坏测试（可选，回归护栏）
 package.json                    # 元数据（零依赖）
 CHANGELOG.md                    # 变更记录
 ```
