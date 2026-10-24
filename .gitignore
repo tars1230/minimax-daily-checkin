@@ -1,0 +1,5 @@
+node_modules/
+*.log
+checkin-last.json
+.DS_Store
+Thumbs.db
